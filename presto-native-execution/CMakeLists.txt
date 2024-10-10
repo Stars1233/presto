@@ -121,6 +121,11 @@ set(VELOX_BUILD_TEST_UTILS
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(DEFINED ENV{INSTALL_PREFIX})
+  message(STATUS "Dependency install directory set to: $ENV{INSTALL_PREFIX}")
+  list(APPEND CMAKE_PREFIX_PATH "$ENV{INSTALL_PREFIX}")
+endif()
+
 set(Boost_USE_MULTITHREADED TRUE)
 find_package(
   Boost
@@ -170,9 +175,6 @@ if(BZIP2_FOUND)
 endif()
 include_directories(SYSTEM ${FOLLY_INCLUDE_DIRS})
 
-# Include third party header files
-find_path(OPT_OPENSSL_DIR NAMES opt/openssl@1.1)
-set(OPENSSL_ROOT_DIR "${OPT_OPENSSL_DIR}/opt/openssl@1.1")
 find_package(OpenSSL REQUIRED)
 
 find_package(Sodium REQUIRED)
@@ -229,6 +231,13 @@ set(CMAKE_JOB_POOL_LINK presto_link_job_pool)
 # build
 if("${TREAT_WARNINGS_AS_ERRORS}")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+endif()
+
+if(DEFINED ENV{INSTALL_PREFIX})
+  # Allow installed package headers to be picked up before brew/system package
+  # headers. We set this after Velox since Velox handles INSTALL_PREFIX its own
+  # way.
+  include_directories(BEFORE "$ENV{INSTALL_PREFIX}/include")
 endif()
 
 add_subdirectory(presto_cpp)

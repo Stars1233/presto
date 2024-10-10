@@ -30,12 +30,15 @@ import com.facebook.presto.hive.HiveHdfsConfiguration;
 import com.facebook.presto.hive.MetastoreClientConfig;
 import com.facebook.presto.hive.authentication.NoHdfsAuthentication;
 import com.facebook.presto.iceberg.delete.DeleteFile;
+import com.facebook.presto.metadata.CatalogMetadata;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.metadata.MetadataUtil;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.Constraint;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.analyzer.MetadataResolver;
+import com.facebook.presto.spi.connector.classloader.ClassLoaderSafeConnectorMetadata;
 import com.facebook.presto.spi.security.AllowAllAccessControl;
 import com.facebook.presto.spi.statistics.ColumnStatistics;
 import com.facebook.presto.spi.statistics.Estimate;
@@ -46,9 +49,11 @@ import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
+import com.google.common.cache.CacheStats;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Maps;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -74,6 +79,7 @@ import org.apache.iceberg.hadoop.HadoopOutputFile;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.TableScanUtil;
+import org.apache.parquet.column.ParquetProperties.WriterVersion;
 import org.intellij.lang.annotations.Language;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
@@ -81,6 +87,7 @@ import org.testng.annotations.Test;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -129,6 +136,8 @@ import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static org.apache.iceberg.SnapshotSummary.TOTAL_DATA_FILES_PROP;
 import static org.apache.iceberg.SnapshotSummary.TOTAL_DELETE_FILES_PROP;
+import static org.apache.parquet.column.ParquetProperties.WriterVersion.PARQUET_1_0;
+import static org.apache.parquet.column.ParquetProperties.WriterVersion.PARQUET_2_0;
 import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertTrue;
 
@@ -933,7 +942,7 @@ public abstract class IcebergDistributedTestBase
         Session weightedSession = Session.builder(getSession())
                 .setCatalogSessionProperty("iceberg", STATISTIC_SNAPSHOT_RECORD_DIFFERENCE_WEIGHT, "10000000")
                 .build();
-        Function<Integer, Estimate> ndvs = (x) -> columnStatsFor(getTableStats("test_stat_dist", Optional.of(snapshots.get(x)), weightedSession), "col0")
+        Function<Integer, Estimate> ndvs = (x) -> columnStatsFor(getTableStats("test_stat_dist", Optional.of(snapshots.get(x)), weightedSession, Optional.empty()), "col0")
                 .getDistinctValuesCount();
         assertEquals(ndvs.apply(0).getValue(), 1);
         assertEquals(ndvs.apply(1).getValue(), 1);
@@ -991,10 +1000,10 @@ public abstract class IcebergDistributedTestBase
 
     private TableStatistics getTableStats(String name, Optional<Long> snapshot)
     {
-        return getTableStats(name, snapshot, getSession());
+        return getTableStats(name, snapshot, getSession(), Optional.empty());
     }
 
-    private TableStatistics getTableStats(String name, Optional<Long> snapshot, Session session)
+    private TableStatistics getTableStats(String name, Optional<Long> snapshot, Session session, Optional<List<String>> columns)
     {
         TransactionId transactionId = getQueryRunner().getTransactionManager().beginTransaction(false);
         Session metadataSession = session.beginTransactionId(
@@ -1008,7 +1017,9 @@ public abstract class IcebergDistributedTestBase
         TableHandle handle = resolver.getTableHandle(QualifiedObjectName.valueOf(qualifiedName)).get();
         return metadata.getTableStatistics(metadataSession,
                 handle,
-                new ArrayList<>(resolver.getColumnHandles(handle).values()),
+                new ArrayList<>(columns
+                        .map(columnSet -> Maps.filterKeys(resolver.getColumnHandles(handle), columnSet::contains))
+                        .orElse(resolver.getColumnHandles(handle)).values()),
                 Constraint.alwaysTrue());
     }
 
@@ -1625,19 +1636,24 @@ public abstract class IcebergDistributedTestBase
     @Test
     public void testRefsTable()
     {
-        assertUpdate("CREATE TABLE test_table_references (id BIGINT)");
-        assertUpdate("INSERT INTO test_table_references VALUES (0), (1), (2)", 3);
+        assertUpdate("CREATE TABLE test_table_references (id1 BIGINT, id2 BIGINT)");
+        assertUpdate("INSERT INTO test_table_references VALUES (0, 00), (1, 10), (2, 20)", 3);
 
         Table icebergTable = loadTable("test_table_references");
         icebergTable.manageSnapshots().createBranch("testBranch").commit();
 
-        assertUpdate("INSERT INTO test_table_references VALUES (0), (1), (2)", 3);
+        assertUpdate("INSERT INTO test_table_references VALUES (3, 30), (4, 40), (5, 50)", 3);
 
         assertEquals(icebergTable.refs().size(), 2);
         icebergTable.manageSnapshots().createTag("testTag", icebergTable.currentSnapshot().snapshotId()).commit();
 
         assertEquals(icebergTable.refs().size(), 3);
+        assertUpdate("INSERT INTO test_table_references VALUES (6, 60), (7, 70), (8, 80)", 3);
         assertQuery("SELECT count(*) FROM \"test_table_references$refs\"", "VALUES 3");
+
+        assertQuery("SELECT count(*) FROM test_table_references FOR SYSTEM_VERSION AS OF 'testBranch'", "VALUES 3");
+        assertQuery("SELECT count(*) FROM test_table_references FOR SYSTEM_VERSION AS OF 'testTag'", "VALUES 6");
+        assertQuery("SELECT count(*) FROM test_table_references FOR SYSTEM_VERSION AS OF 'main'", "VALUES 9");
 
         assertQuery("SELECT * from \"test_table_references$refs\" where name = 'testBranch' and type = 'BRANCH'",
                 format("VALUES('%s', '%s', %s, %s, %s, %s)",
@@ -1656,6 +1672,17 @@ public abstract class IcebergDistributedTestBase
                         icebergTable.refs().get("testTag").maxRefAgeMs(),
                         icebergTable.refs().get("testTag").minSnapshotsToKeep(),
                         icebergTable.refs().get("testTag").maxSnapshotAgeMs()));
+
+        // test branch & tag access when schema is changed
+        assertUpdate("ALTER TABLE test_table_references DROP COLUMN id2");
+        assertUpdate("ALTER TABLE test_table_references ADD COLUMN id2_new BIGINT");
+
+        // since current table schema is changed from col id2 to id2_new
+        assertQuery("SELECT * FROM test_table_references where id1=1", "VALUES(1, NULL)");
+        assertQuery("SELECT * FROM test_table_references FOR SYSTEM_VERSION AS OF 'testBranch' where id1=1", "VALUES(1, NULL)");
+        // Currently Presto returns current table schema for any previous snapshot access https://github.com/prestodb/presto/issues/23553
+        // otherwise querying a tag uses the snapshot's schema https://iceberg.apache.org/docs/nightly/branching/#schema-selection-with-branches-and-tags
+        assertQuery("SELECT * FROM test_table_references FOR SYSTEM_VERSION AS OF 'testTag' where id1=1", "VALUES(1, NULL)");
     }
 
     @Test
@@ -1814,10 +1841,10 @@ public abstract class IcebergDistributedTestBase
         @Language("SQL") String query = "SELECT * FROM test_filterstats_remaining_predicate WHERE (i = 10 AND j = 11) OR (i = 20 AND j = 21)";
         if (pushdownFilterEnabled) {
             assertPlan(session, query,
-                            output(
-                                    exchange(
-                                            tableScan("test_filterstats_remaining_predicate")
-                                                    .withOutputRowCount(1))));
+                    output(
+                            exchange(
+                                    tableScan("test_filterstats_remaining_predicate")
+                                            .withOutputRowCount(1))));
         }
         else {
             assertPlan(session, query,
@@ -1827,6 +1854,66 @@ public abstract class IcebergDistributedTestBase
                                     .withOutputRowCount(1)));
         }
         assertQuerySucceeds("DROP TABLE test_filterstats_remaining_predicate");
+    }
+
+    public void testStatisticsFileCache()
+            throws Exception
+    {
+        assertQuerySucceeds("CREATE TABLE test_statistics_file_cache(i int)");
+        assertUpdate("INSERT INTO test_statistics_file_cache VALUES 1, 2, 3, 4, 5", 5);
+        assertQuerySucceeds("ANALYZE test_statistics_file_cache");
+        Session session = Session.builder(getSession())
+                .setTransactionId(getQueryRunner().getTransactionManager().beginTransaction(false))
+                .build();
+        Optional<TableHandle> handle = MetadataUtil.getOptionalTableHandle(session,
+                getQueryRunner().getTransactionManager(),
+                QualifiedObjectName.valueOf(session.getCatalog().get(), session.getSchema().get(), "test_statistics_file_cache"),
+                Optional.empty());
+        CatalogMetadata catalogMetadata = getQueryRunner().getTransactionManager()
+                .getCatalogMetadata(session.getTransactionId().get(), handle.get().getConnectorId());
+        // There isn't an easy way to access the cache internally, so use some reflection to grab it
+        Field delegate = ClassLoaderSafeConnectorMetadata.class.getDeclaredField("delegate");
+        delegate.setAccessible(true);
+        IcebergAbstractMetadata metadata = (IcebergAbstractMetadata) delegate.get(catalogMetadata.getMetadataFor(handle.get().getConnectorId()));
+        CacheStats initial = metadata.statisticsFileCache.stats();
+        assertEquals(metadata.statisticsFileCache.stats().minus(initial).hitCount(), 0);
+        TableStatistics stats = getTableStats("test_statistics_file_cache", Optional.empty(), getSession(), Optional.of(ImmutableList.of("i")));
+        assertEquals(stats.getRowCount().getValue(), 5);
+        assertEquals(metadata.statisticsFileCache.stats().minus(initial).missCount(), 1);
+        getTableStats("test_statistics_file_cache", Optional.empty(), getSession(), Optional.of(ImmutableList.of("i")));
+        assertEquals(metadata.statisticsFileCache.stats().minus(initial).missCount(), 1);
+        assertEquals(metadata.statisticsFileCache.stats().minus(initial).hitCount(), 1);
+        getQueryRunner().execute("DROP TABLE test_statistics_file_cache");
+    }
+
+    @DataProvider(name = "parquetVersions")
+    public Object[][] parquetVersionsDataProvider()
+    {
+        return new Object[][] {
+                {PARQUET_1_0},
+                {PARQUET_2_0},
+        };
+    }
+
+    @Test(dataProvider = "parquetVersions")
+    public void testBatchReadOnTimeType(WriterVersion writerVersion)
+    {
+        Session parquetVersionSession = Session.builder(getSession())
+                .setCatalogSessionProperty("iceberg", "parquet_writer_version", writerVersion.toString())
+                .build();
+        assertQuerySucceeds(parquetVersionSession, "CREATE TABLE time_batch_read(i int, t time)");
+        assertUpdate(parquetVersionSession, "INSERT INTO time_batch_read VALUES (0, time '1:00:00.000'), (1, time '1:00:00.000'), (2, time '1:00:00.000')", 3);
+        Session disabledBatchRead = Session.builder(parquetVersionSession)
+                .setCatalogSessionProperty("iceberg", PARQUET_BATCH_READ_OPTIMIZATION_ENABLED, "false")
+                .build();
+        Session enabledBatchRead = Session.builder(parquetVersionSession)
+                .setCatalogSessionProperty("iceberg", PARQUET_BATCH_READ_OPTIMIZATION_ENABLED, "true")
+                .build();
+        @Language("SQL") String query = "SELECT t FROM time_batch_read ORDER BY i LIMIT 1";
+        MaterializedResult disabledResult = getQueryRunner().execute(disabledBatchRead, query);
+        MaterializedResult enabledResult = getQueryRunner().execute(enabledBatchRead, query);
+        assertEquals(disabledResult, enabledResult);
+        assertQuerySucceeds("DROP TABLE time_batch_read");
     }
 
     private void testCheckDeleteFiles(Table icebergTable, int expectedSize, List<FileContent> expectedFileContent)

@@ -74,6 +74,7 @@ import com.facebook.presto.sql.parser.SqlParserOptions;
 import com.facebook.presto.sql.planner.ConnectorPlanOptimizerManager;
 import com.facebook.presto.sql.planner.NodePartitioningManager;
 import com.facebook.presto.sql.planner.Plan;
+import com.facebook.presto.sql.planner.sanity.PlanCheckerProviderManager;
 import com.facebook.presto.storage.TempStorageManager;
 import com.facebook.presto.testing.ProcedureTester;
 import com.facebook.presto.testing.TestingAccessControlManager;
@@ -173,6 +174,7 @@ public class TestingPrestoServer
     private final boolean nodeSchedulerIncludeCoordinator;
     private final ServerInfoResource serverInfoResource;
     private final ResourceManagerClusterStateProvider clusterStateProvider;
+    private final PlanCheckerProviderManager planCheckerProviderManager;
 
     public static class TestShutdownAction
             implements ShutdownAction
@@ -243,6 +245,7 @@ public class TestingPrestoServer
                 false,
                 false,
                 coordinator,
+                false,
                 properties,
                 environment,
                 discoveryUri,
@@ -259,6 +262,7 @@ public class TestingPrestoServer
             boolean coordinatorSidecar,
             boolean coordinatorSidecarEnabled,
             boolean coordinator,
+            boolean skipLoadingResourceGroupConfigurationManager,
             Map<String, String> properties,
             String environment,
             URI discoveryUri,
@@ -368,13 +372,16 @@ public class TestingPrestoServer
             this.resourceGroupManager = resourceGroupManager instanceof InternalResourceGroupManager
                     ? Optional.of((InternalResourceGroupManager<?>) resourceGroupManager)
                     : Optional.empty();
-            resourceGroupManager.loadConfigurationManager();
+            if (!skipLoadingResourceGroupConfigurationManager) {
+                resourceGroupManager.loadConfigurationManager();
+            }
             nodePartitioningManager = injector.getInstance(NodePartitioningManager.class);
             planOptimizerManager = injector.getInstance(ConnectorPlanOptimizerManager.class);
             clusterMemoryManager = injector.getInstance(ClusterMemoryManager.class);
             statsCalculator = injector.getInstance(StatsCalculator.class);
             eventListenerManager = ((TestingEventListenerManager) injector.getInstance(EventListenerManager.class));
             clusterStateProvider = null;
+            planCheckerProviderManager = injector.getInstance(PlanCheckerProviderManager.class);
         }
         else if (resourceManager) {
             dispatchManager = null;
@@ -386,6 +393,7 @@ public class TestingPrestoServer
             statsCalculator = null;
             eventListenerManager = ((TestingEventListenerManager) injector.getInstance(EventListenerManager.class));
             clusterStateProvider = injector.getInstance(ResourceManagerClusterStateProvider.class);
+            planCheckerProviderManager = null;
         }
         else if (coordinatorSidecar) {
             dispatchManager = null;
@@ -397,6 +405,7 @@ public class TestingPrestoServer
             statsCalculator = null;
             eventListenerManager = null;
             clusterStateProvider = null;
+            planCheckerProviderManager = null;
         }
         else if (catalogServer) {
             dispatchManager = null;
@@ -408,6 +417,7 @@ public class TestingPrestoServer
             statsCalculator = null;
             eventListenerManager = null;
             clusterStateProvider = null;
+            planCheckerProviderManager = null;
         }
         else {
             dispatchManager = null;
@@ -419,6 +429,7 @@ public class TestingPrestoServer
             statsCalculator = null;
             eventListenerManager = null;
             clusterStateProvider = null;
+            planCheckerProviderManager = null;
         }
         localMemoryManager = injector.getInstance(LocalMemoryManager.class);
         nodeManager = injector.getInstance(InternalNodeManager.class);
@@ -656,6 +667,11 @@ public class TestingPrestoServer
         checkState(coordinator, "not a coordinator");
         checkState(clusterMemoryManager instanceof ClusterMemoryManager);
         return (ClusterMemoryManager) clusterMemoryManager;
+    }
+
+    public PlanCheckerProviderManager getPlanCheckerProviderManager()
+    {
+        return planCheckerProviderManager;
     }
 
     public GracefulShutdownHandler getGracefulShutdownHandler()

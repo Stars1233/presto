@@ -29,6 +29,7 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 
 import static com.facebook.presto.operator.scalar.ArraySortFunction.sort;
@@ -50,6 +51,71 @@ import static java.lang.System.arraycopy;
 public final class IpPrefixFunctions
 {
     private static final BigInteger TWO = BigInteger.valueOf(2);
+
+    private static final Block EMPTY_BLOCK = IPPREFIX.createBlockBuilder(null, 0).build();
+
+    /**
+     * Our definitions for what IANA considers not "globally reachable" are taken from the docs at
+     * https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml and
+     * https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml.
+     * Java's InetAddress.isSiteLocalAddress only covers three of these: 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16,
+     * so we operate over the complete list below.
+     */
+    private static final String[] privatePrefixes = new String[] {
+            // IPv4 private ranges
+            "0.0.0.0/8",        // RFC1122: "This host on this network"
+            "10.0.0.0/8",       // RFC1918: Private-Use
+            "100.64.0.0/10",    // RFC6598: Shared Address Space
+            "127.0.0.0/8",      // RFC1122: Loopback
+            "169.254.0.0/16",   // RFC3927: Link Local
+            "172.16.0.0/12",    // RFC1918: Private-Use
+            "192.0.0.0/24",     // RFC6890: IETF Protocol Assignments
+            "192.0.2.0/24",     // RFC5737: Documentation (TEST-NET-1)
+            "192.88.99.0/24",   // RFC3068: 6to4 Relay anycast
+            "192.168.0.0/16",   // RFC1918: Private-Use
+            "198.18.0.0/15",    // RFC2544: Benchmarking
+            "198.51.100.0/24",  // RFC5737: Documentation (TEST-NET-2)
+            "203.0.113.0/24",   // RFC5737: Documentation (TEST-NET-3)
+            "240.0.0.0/4",      // RFC1112: Reserved
+            // IPv6 private ranges
+            "::/127",           // RFC4291: Unspecified address and Loopback address
+            "64:ff9b:1::/48",   // RFC8215: IPv4-IPv6 Translation
+            "100::/64",         // RFC6666: Discard-Only Address Block
+            "2001:2::/48",      // RFC5180, RFC Errata 1752: Benchmarking
+            "2001:db8::/32",    // RFC3849: Documentation
+            "2001::/23",        // RFC2928: IETF Protocol Assignments
+            "5f00::/16",        // RFC-ietf-6man-sids-06: Segment Routing (SRv6)
+            "fe80::/10",        // RFC4291: Link-Local Unicast
+            "fc00::/7",         // RFC4193, RFC8190: Unique Local
+    };
+
+    private static final List<BigInteger[]> privateIPv4AddressRanges;
+    private static final List<BigInteger[]> privateIPv6AddressRanges;
+
+    static {
+        privateIPv4AddressRanges = new ArrayList<>();
+        privateIPv6AddressRanges = new ArrayList<>();
+        // convert the private prefixes into the first and last BigInteger ranges
+        for (String privatePrefix : privatePrefixes) {
+            Slice ipPrefixSlice = castFromVarcharToIpPrefix(utf8Slice(privatePrefix));
+            Slice startingIpAddress = ipSubnetMin(ipPrefixSlice);
+            Slice endingIpAddress = ipSubnetMax(ipPrefixSlice);
+
+            BigInteger startingIpAsBigInt = toBigInteger(startingIpAddress);
+            BigInteger endingIpAsBigInt = toBigInteger(endingIpAddress);
+
+            BigInteger[] privateRange = new BigInteger[]{startingIpAsBigInt, endingIpAsBigInt};
+
+            if (isIpv4(ipPrefixSlice)) {
+                privateIPv4AddressRanges.add(privateRange);
+            }
+            else {
+                privateIPv6AddressRanges.add(privateRange);
+            }
+        }
+        privateIPv4AddressRanges.sort(Comparator.comparing(e -> e[0]));
+        privateIPv6AddressRanges.sort(Comparator.comparing(e -> e[0]));
+    }
 
     private IpPrefixFunctions() {}
 
@@ -195,6 +261,100 @@ public final class IpPrefixFunctions
         }
 
         return blockBuilder.build();
+    }
+
+    @Description("Returns whether ipAddress is a private or reserved IP address that is not globally reachable.")
+    @ScalarFunction("is_private_ip")
+    @SqlType(StandardTypes.BOOLEAN)
+    public static boolean isPrivateIpAddress(@SqlType(StandardTypes.IPADDRESS) Slice ipAddress)
+    {
+        BigInteger ipAsBigInt = toBigInteger(ipAddress);
+        boolean isIPv4 = isIpv4(ipAddress);
+
+        List<BigInteger[]> rangesToCheck = isIPv4 ? privateIPv4AddressRanges : privateIPv6AddressRanges;
+
+        // rangesToCheck is sorted
+        for (BigInteger[] privateAddressRange : rangesToCheck) {
+            BigInteger startIp = privateAddressRange[0];
+            BigInteger endIp = privateAddressRange[1];
+
+            if (ipAsBigInt.compareTo(startIp) < 0) {
+                return false;  // current and subsequent ranges are all higher values, so we can fail fast here.
+            }
+
+            // ipAddress at least >= to startIp
+
+            if (ipAsBigInt.compareTo(endIp) <= 0) {
+                return true;  // if ipAsBigInt is in between startIp and endIp of private range then return true
+            }
+        }
+
+        return false;
+    }
+
+    @Description("Split the input prefix into subnets the size of the new prefix length.")
+    @ScalarFunction("ip_prefix_subnets")
+    @SqlType("array(IPPREFIX)")
+    public static Block ipPrefixSubnets(@SqlType(StandardTypes.IPPREFIX) Slice prefix, @SqlType(StandardTypes.BIGINT) long newPrefixLength)
+    {
+        boolean inputIsIpV4 = isIpv4(prefix);
+
+        if (newPrefixLength < 0 || (inputIsIpV4 && newPrefixLength > 32) || (!inputIsIpV4 && newPrefixLength > 128)) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, "Invalid prefix length for IPv" + (inputIsIpV4 ? "4" : "6") + ": " + newPrefixLength);
+        }
+
+        int inputPrefixLength = getPrefixLength(prefix);
+        // An IP prefix is a 'network', or group of contiguous IP addresses. The common format for describing IP prefixes is
+        // uses 2 parts separated by a '/': (1) the IP address part and the (2) prefix length part (also called subnet size or CIDR).
+        // For example, in 9.255.255.0/24, 9.255.255.0 is the IP address part and 24 is the prefix length.
+        // The prefix length describes how many IP addresses the prefix contains in terms of the leading number of bits required. A higher number of bits
+        // means smaller number of IP addresses. Subnets inherently mean smaller groups of IP addresses.
+        // We can only disaggregate a prefix if the prefix length is the same length or longer (more-specific) than the length of the input prefix.
+        // E.g., if the input prefix is 9.255.255.0/24, the prefix length can be /24, /25, /26, etc... but not 23 or larger value than 24.
+
+        int newPrefixCount = 0;  // if inputPrefixLength > newPrefixLength, there are no new prefixes and we will return an empty array.
+        if (inputPrefixLength <= newPrefixLength) {
+            // Next, count how many new prefixes we will generate. In general, every difference in prefix length doubles the number new prefixes.
+            // For example if we start with 9.255.255.0/24, and want to split into /25s, we would have 2 new prefixes. If we wanted to split into /26s,
+            // we would have 4 new prefixes, and /27 would have 8 prefixes etc....
+            newPrefixCount = 1 << (newPrefixLength - inputPrefixLength);  // 2^N
+        }
+
+        if (newPrefixCount == 0) {
+            return EMPTY_BLOCK;
+        }
+
+        BlockBuilder blockBuilder = IPPREFIX.createBlockBuilder(null, newPrefixCount);
+
+        if (newPrefixCount == 1) {
+            IPPREFIX.writeSlice(blockBuilder, prefix); // just return the original prefix in an array
+            return blockBuilder.build(); // returns empty or single entry
+        }
+
+        int ipVersionMaxBits = inputIsIpV4 ? 32 : 128;
+        BigInteger newPrefixIpCount = TWO.pow(ipVersionMaxBits - (int) newPrefixLength);
+
+        Slice startingIpAddressAsSlice = ipSubnetMin(prefix);
+        BigInteger currentIpAddress = toBigInteger(startingIpAddressAsSlice);
+
+        try {
+            for (int i = 0; i < newPrefixCount; i++) {
+                InetAddress asInetAddress = bigIntegerToIpAddress(currentIpAddress);
+                Slice ipPrefixAsSlice = castFromVarcharToIpPrefix(utf8Slice(InetAddresses.toAddrString(asInetAddress) + "/" + newPrefixLength));
+                IPPREFIX.writeSlice(blockBuilder, ipPrefixAsSlice);
+                currentIpAddress = currentIpAddress.add(newPrefixIpCount);   // increment to start of next new prefix
+            }
+        }
+        catch (UnknownHostException ex) {
+            throw new PrestoException(GENERIC_INTERNAL_ERROR, "Unable to convert " + currentIpAddress + " to IP prefix", ex);
+        }
+
+        return blockBuilder.build();
+    }
+
+    private static int getPrefixLength(Slice ipPrefix)
+    {
+        return ipPrefix.getByte(IPPREFIX.getFixedSize() - 1) & 0xFF;
     }
 
     private static List<Slice> generateMinIpPrefixes(BigInteger firstIpAddress, BigInteger lastIpAddress, int ipVersionMaxBits)

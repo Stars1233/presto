@@ -10,7 +10,9 @@ dependency-reduced-pom.xml
 test-output/
 test-reports/
 /atlassian-ide-plugin.xml
-.idea
+.idea/*
+*/.idea
+!.idea/icon.png
 .run
 .vscode
 .DS_Store
@@ -38,6 +40,8 @@ cmake-build-*/
 *.swp
 *~
 a.out
+presto-native-execution/deps-download
+presto-native-execution/deps-install
 
 # Compiled Object files
 *.slo

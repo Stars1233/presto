@@ -46,6 +46,7 @@ import com.facebook.presto.sql.parser.SqlParserOptions;
 import com.facebook.presto.sql.planner.ConnectorPlanOptimizerManager;
 import com.facebook.presto.sql.planner.NodePartitioningManager;
 import com.facebook.presto.sql.planner.Plan;
+import com.facebook.presto.sql.planner.sanity.PlanCheckerProviderManager;
 import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.testing.TestingAccessControlManager;
@@ -141,6 +142,7 @@ public class DistributedQueryRunner
                 false,
                 false,
                 false,
+                false,
                 defaultSession,
                 nodeCount,
                 1,
@@ -166,6 +168,7 @@ public class DistributedQueryRunner
             boolean resourceManagerEnabled,
             boolean catalogServerEnabled,
             boolean coordinatorSidecarEnabled,
+            boolean skipLoadingResourceGroupConfigurationManager,
             Session defaultSession,
             int nodeCount,
             int coordinatorCount,
@@ -232,6 +235,7 @@ public class DistributedQueryRunner
                             false,
                             coordinatorSidecarEnabled,
                             false,
+                            skipLoadingResourceGroupConfigurationManager,
                             workerProperties,
                             parserOptions,
                             environment,
@@ -261,6 +265,7 @@ public class DistributedQueryRunner
                             false,
                             false,
                             false,
+                            skipLoadingResourceGroupConfigurationManager,
                             rmProperties,
                             parserOptions,
                             environment,
@@ -281,6 +286,7 @@ public class DistributedQueryRunner
                         false,
                         false,
                         false,
+                        skipLoadingResourceGroupConfigurationManager,
                         catalogServerProperties,
                         parserOptions,
                         environment,
@@ -299,6 +305,7 @@ public class DistributedQueryRunner
                         true,
                         true,
                         false,
+                        skipLoadingResourceGroupConfigurationManager,
                         coordinatorSidecarProperties,
                         parserOptions,
                         environment,
@@ -317,6 +324,7 @@ public class DistributedQueryRunner
                         false,
                         false,
                         true,
+                        skipLoadingResourceGroupConfigurationManager,
                         extraCoordinatorProperties,
                         parserOptions,
                         environment,
@@ -414,6 +422,7 @@ public class DistributedQueryRunner
             boolean coordinatorSidecar,
             boolean coordinatorSidecarEnabled,
             boolean coordinator,
+            boolean skipLoadingResourceGroupConfigurationManager,
             Map<String, String> extraProperties,
             SqlParserOptions parserOptions,
             String environment,
@@ -444,6 +453,7 @@ public class DistributedQueryRunner
                 coordinatorSidecar,
                 coordinatorSidecarEnabled,
                 coordinator,
+                skipLoadingResourceGroupConfigurationManager,
                 properties,
                 environment,
                 discoveryUri,
@@ -570,6 +580,13 @@ public class DistributedQueryRunner
     {
         checkState(coordinators.size() == 1, "Expected a single coordinator");
         return coordinators.get(0).getAccessControl();
+    }
+
+    @Override
+    public PlanCheckerProviderManager getPlanCheckerProviderManager()
+    {
+        checkState(coordinators.size() == 1, "Expected a single coordinator");
+        return coordinators.get(0).getPlanCheckerProviderManager();
     }
 
     public TestingPrestoServer getCoordinator()
@@ -943,6 +960,7 @@ public class DistributedQueryRunner
         private boolean resourceManagerEnabled;
         private boolean catalogServerEnabled;
         private boolean coordinatorSidecarEnabled;
+        private boolean skipLoadingResourceGroupConfigurationManager;
         private List<Module> extraModules = ImmutableList.of();
         private int resourceManagerCount = 1;
 
@@ -1074,6 +1092,12 @@ public class DistributedQueryRunner
             return this;
         }
 
+        public Builder setSkipLoadingResourceGroupConfigurationManager(boolean skipLoadingResourceGroupConfigurationManager)
+        {
+            this.skipLoadingResourceGroupConfigurationManager = skipLoadingResourceGroupConfigurationManager;
+            return this;
+        }
+
         public DistributedQueryRunner build()
                 throws Exception
         {
@@ -1081,6 +1105,7 @@ public class DistributedQueryRunner
                     resourceManagerEnabled,
                     catalogServerEnabled,
                     coordinatorSidecarEnabled,
+                    skipLoadingResourceGroupConfigurationManager,
                     defaultSession,
                     nodeCount,
                     coordinatorCount,

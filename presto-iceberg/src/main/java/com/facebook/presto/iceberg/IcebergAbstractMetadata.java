@@ -19,12 +19,15 @@ import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.BigintType;
 import com.facebook.presto.common.type.SqlTimestampWithTimeZone;
+import com.facebook.presto.common.type.TimestampType;
 import com.facebook.presto.common.type.TimestampWithTimeZoneType;
 import com.facebook.presto.common.type.TypeManager;
+import com.facebook.presto.common.type.VarcharType;
 import com.facebook.presto.hive.HivePartition;
 import com.facebook.presto.hive.HiveWrittenPartitions;
 import com.facebook.presto.hive.NodeVersion;
 import com.facebook.presto.iceberg.changelog.ChangelogUtil;
+import com.facebook.presto.iceberg.statistics.StatisticsFileCache;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
@@ -182,6 +185,7 @@ public abstract class IcebergAbstractMetadata
     protected final RowExpressionService rowExpressionService;
     protected final FilterStatsCalculatorService filterStatsCalculatorService;
     protected Transaction transaction;
+    protected final StatisticsFileCache statisticsFileCache;
 
     private final StandardFunctionResolution functionResolution;
     private final ConcurrentMap<SchemaTableName, Table> icebergTables = new ConcurrentHashMap<>();
@@ -192,7 +196,8 @@ public abstract class IcebergAbstractMetadata
             RowExpressionService rowExpressionService,
             JsonCodec<CommitTaskData> commitTaskCodec,
             NodeVersion nodeVersion,
-            FilterStatsCalculatorService filterStatsCalculatorService)
+            FilterStatsCalculatorService filterStatsCalculatorService,
+            StatisticsFileCache statisticsFileCache)
     {
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
         this.commitTaskCodec = requireNonNull(commitTaskCodec, "commitTaskCodec is null");
@@ -200,6 +205,7 @@ public abstract class IcebergAbstractMetadata
         this.rowExpressionService = requireNonNull(rowExpressionService, "rowExpressionService is null");
         this.nodeVersion = requireNonNull(nodeVersion, "nodeVersion is null");
         this.filterStatsCalculatorService = requireNonNull(filterStatsCalculatorService, "filterStatsCalculatorService is null");
+        this.statisticsFileCache = requireNonNull(statisticsFileCache, "statisticsFileCache is null");
     }
 
     protected final Table getIcebergTable(ConnectorSession session, SchemaTableName schemaTableName)
@@ -733,7 +739,7 @@ public abstract class IcebergAbstractMetadata
     @Override
     public TableStatistics getTableStatistics(ConnectorSession session, ConnectorTableHandle tableHandle, Optional<ConnectorTableLayoutHandle> tableLayoutHandle, List<ColumnHandle> columnHandles, Constraint<ColumnHandle> constraint)
     {
-        TableStatistics baseStatistics = calculateBaseTableStatistics(this, typeManager, session, (IcebergTableHandle) tableHandle, tableLayoutHandle, columnHandles, constraint);
+        TableStatistics baseStatistics = calculateBaseTableStatistics(this, typeManager, session, statisticsFileCache, (IcebergTableHandle) tableHandle, tableLayoutHandle, columnHandles, constraint);
         return calculateStatisticsConsideringLayout(filterStatsCalculatorService, rowExpressionService, baseStatistics, session, tableLayoutHandle);
     }
 
@@ -976,11 +982,17 @@ public abstract class IcebergAbstractMetadata
                 long millisUtc = new SqlTimestampWithTimeZone((long) tableVersion.getTableVersion()).getMillisUtc();
                 return getSnapshotIdTimeOperator(table, millisUtc, tableVersion.getVersionOperator());
             }
+            else if (tableVersion.getVersionExpressionType() instanceof TimestampType) {
+                long timestampValue = (long) tableVersion.getTableVersion();
+                long millisUtc = ((TimestampType) tableVersion.getVersionExpressionType()).getPrecision().toMillis(timestampValue);
+                return getSnapshotIdTimeOperator(table, millisUtc, tableVersion.getVersionOperator());
+            }
             throw new PrestoException(NOT_SUPPORTED, "Unsupported table version expression type: " + tableVersion.getVersionExpressionType());
         }
         if (tableVersion.getVersionType() == VersionType.VERSION) {
+            long snapshotId;
             if (tableVersion.getVersionExpressionType() instanceof BigintType) {
-                long snapshotId = (long) tableVersion.getTableVersion();
+                snapshotId = (long) tableVersion.getTableVersion();
                 if (table.snapshot(snapshotId) == null) {
                     throw new PrestoException(ICEBERG_INVALID_SNAPSHOT_ID, "Iceberg snapshot ID does not exists: " + snapshotId);
                 }
@@ -990,6 +1002,13 @@ public abstract class IcebergAbstractMetadata
                 else { // BEFORE Case
                     return getSnapshotIdTimeOperator(table, table.snapshot(snapshotId).timestampMillis(), VersionOperator.LESS_THAN);
                 }
+            }
+            else if (tableVersion.getVersionExpressionType() instanceof VarcharType) {
+                String branchOrTagName = ((Slice) tableVersion.getTableVersion()).toStringUtf8();
+                if (!table.refs().containsKey(branchOrTagName)) {
+                    throw new PrestoException(ICEBERG_INVALID_SNAPSHOT_ID, "Could not find Iceberg table branch or tag: " + branchOrTagName);
+                }
+                return table.refs().get(branchOrTagName).snapshotId();
             }
             throw new PrestoException(NOT_SUPPORTED, "Unsupported table version expression type: " + tableVersion.getVersionExpressionType());
         }
